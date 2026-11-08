@@ -3,7 +3,8 @@ use std::collections::BTreeSet;
 use hydradb_cypher_ast::{
     BinaryOperator, Clause, Direction, Document, Expression, Identifier, Literal, MatchClause,
     NodePattern, OrderDirection, PathPattern, PatternElement, Projection, ProjectionItems, Query,
-    QueryFailureReason, ReturnClause, SetQuantifier, Statement, UnaryOperator, WithClause,
+    QueryFailureReason, ReturnClause, SetQuantifier, SortItem, Statement, UnaryOperator,
+    WithClause,
 };
 
 use crate::{
@@ -619,17 +620,33 @@ fn lower_query(query: &Query) -> GraphPlanResult<GraphLogicalPlan> {
     reject_synthesized_collisions(&declared, &synthesized)?;
     let mut plan = plan.unwrap_or(GraphLogicalPlan::SingleRow);
     let items = &star_expanded(&returned.items, &visible, "RETURN")?;
+    let distinct = matches!(returned.quantifier, Some(SetQuantifier::Distinct));
     {
         // Validate every result reference, including initial OPTIONAL MATCH.
         for item in items {
             check_scope(&item.expression, &visible, "RETURN")?;
         }
-        // ORDER BY at the result may also name a column the projection just
-        // created, which is not a binding at all.
-        let mut sortable = visible.clone();
-        sortable.extend(item_aliases(items));
-        for item in &returned.order_by {
-            check_scope(&item.expression, &sortable, "ORDER BY")?;
+        let grouped = distinct
+            || items
+                .iter()
+                .any(|item| ast_contains_aggregate(&item.expression));
+        if grouped {
+            // Aggregation and DISTINCT fold the binding rows into the returned
+            // columns, so a sort may read a column, repeat a returned
+            // expression, or aggregate over the group, and nothing else. A
+            // binding the projection dropped belongs to no one row of its
+            // group; sorting by it would pick whichever row the group kept.
+            // Neo4j refuses it as an undefined variable (TCK ReturnOrderBy2
+            // [13], ReturnOrderBy6 [4]), and so does WITH here.
+            check_grouped_sort_scope(items, &returned.order_by)?;
+        } else {
+            // ORDER BY at the result may also name a column the projection just
+            // created, which is not a binding at all.
+            let mut sortable = visible.clone();
+            sortable.extend(item_aliases(items));
+            for item in &returned.order_by {
+                check_scope(&item.expression, &sortable, "ORDER BY")?;
+            }
         }
     }
     let items = items
@@ -667,7 +684,6 @@ fn lower_query(query: &Query) -> GraphPlanResult<GraphLogicalPlan> {
             items: sort_items.clone(),
         };
     }
-    let distinct = matches!(returned.quantifier, Some(SetQuantifier::Distinct));
     // SKIP and LIMIT count result rows. Aggregation and DISTINCT both change
     // how many rows there are, so their window applies after the projection,
     // never to the binding rows beneath it.
@@ -1536,6 +1552,104 @@ fn is_count_star(expression: &Expression) -> bool {
             if matches!(name.as_slice(), [function] if function.as_str().eq_ignore_ascii_case("count"))
                 && matches!(arguments.as_slice(), [Expression::Syntax(fragment)] if fragment.text() == "*")
     )
+}
+
+/// The column name a returned item without an alias stands for while a sort
+/// over an aggregating or DISTINCT RETURN is checked. It never reaches a
+/// plan: the check replaces the item's expression with it and reads the
+/// bindings that remain.
+const RETURN_ITEM_PREFIX: &str = "__hydradb_return_item_";
+
+/// What an aggregate call stands for in that same check. The call reads the
+/// group's rows, which is allowed; the mask keeps the bindings inside it from
+/// counting as reads of the result.
+const AGGREGATE_MASK: &str = "__hydradb_aggregate";
+
+/// Refuse a sort over an aggregating or DISTINCT RETURN that reads a binding
+/// the projection dropped.
+///
+/// Each returned expression is replaced by its column name first, so
+/// `RETURN me.age AS age, count(you) AS cnt ORDER BY me.age + count(you)` is
+/// a sort over `age` and `cnt`. Aggregates are then masked. Any binding that
+/// is still read names a row the result no longer has.
+fn check_grouped_sort_scope(items: &[Projection], order_by: &[SortItem]) -> GraphPlanResult<()> {
+    let mut columns = BTreeSet::new();
+    let replacements: Vec<(Expression, Identifier)> = items
+        .iter()
+        .enumerate()
+        .map(|(index, item)| {
+            let name = match &item.alias {
+                Some(alias) => alias.clone(),
+                None => Identifier::from(format!("{RETURN_ITEM_PREFIX}{index}").as_str()),
+            };
+            columns.insert(Symbol::from(name.as_str()));
+            (item.expression.clone(), name)
+        })
+        .collect();
+    columns.insert(Symbol::from(AGGREGATE_MASK));
+    for sort in order_by {
+        let expression = mask_aggregates(&replace_group_keys(&sort.expression, &replacements));
+        check_scope(&expression, &columns, "ORDER BY after RETURN")?;
+    }
+    Ok(())
+}
+
+/// `expression` with every aggregate call replaced by [`AGGREGATE_MASK`].
+fn mask_aggregates(expression: &Expression) -> Expression {
+    match expression {
+        Expression::Function { name, .. } if matches!(name.as_slice(), [name] if AggregateFunction::from_name(name.as_str()).is_some()) => {
+            Expression::Identifier(Identifier::from(AGGREGATE_MASK))
+        }
+        Expression::Function {
+            name,
+            distinct,
+            arguments,
+        } => Expression::Function {
+            name: name.clone(),
+            distinct: *distinct,
+            arguments: arguments.iter().map(mask_aggregates).collect(),
+        },
+        Expression::Unary {
+            operator,
+            expression,
+        } => Expression::Unary {
+            operator: *operator,
+            expression: Box::new(mask_aggregates(expression)),
+        },
+        Expression::Binary {
+            left,
+            operator,
+            right,
+        } => Expression::Binary {
+            left: Box::new(mask_aggregates(left)),
+            operator: *operator,
+            right: Box::new(mask_aggregates(right)),
+        },
+        Expression::Property { target, key } => Expression::Property {
+            target: Box::new(mask_aggregates(target)),
+            key: key.clone(),
+        },
+        Expression::List(items) => Expression::List(items.iter().map(mask_aggregates).collect()),
+        Expression::Map(entries) => Expression::Map(
+            entries
+                .iter()
+                .map(|(key, value)| (key.clone(), mask_aggregates(value)))
+                .collect(),
+        ),
+        Expression::Case {
+            operand,
+            branches,
+            default,
+        } => Expression::Case {
+            operand: operand.as_ref().map(|e| Box::new(mask_aggregates(e))),
+            branches: branches
+                .iter()
+                .map(|(when, then)| (mask_aggregates(when), mask_aggregates(then)))
+                .collect(),
+            default: default.as_ref().map(|e| Box::new(mask_aggregates(e))),
+        },
+        _ => expression.clone(),
+    }
 }
 
 fn check_scope(
@@ -2523,4 +2637,58 @@ fn item_aliases(items: &[Projection]) -> BTreeSet<Symbol> {
                 .map(|alias| Symbol::from(alias.as_str()))
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::LoweredTemplate;
+
+    fn lower(query: &str) -> Result<(), String> {
+        LoweredTemplate::lower(query)
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+    }
+
+    #[test]
+    fn aggregating_return_cannot_sort_by_a_dropped_binding() {
+        let error =
+            lower("MATCH (a)-[:KNOWS]->(b) RETURN a.name AS name, count(b) AS c ORDER BY b.age")
+                .unwrap_err();
+        assert!(
+            error.contains("ORDER BY after RETURN references out-of-scope binding b"),
+            "{error}"
+        );
+        let error =
+            lower("MATCH (a)-[:KNOWS]->(b) RETURN count(b) AS agg ORDER BY a.age + count(b)")
+                .unwrap_err();
+        assert!(error.contains("out-of-scope binding a"), "{error}");
+    }
+
+    #[test]
+    fn distinct_return_cannot_sort_by_a_dropped_binding() {
+        let error = lower("MATCH (a) RETURN DISTINCT a.name ORDER BY a.age").unwrap_err();
+        assert!(
+            error.contains("ORDER BY after RETURN references out-of-scope binding a"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn grouped_return_sorts_by_columns_returned_expressions_and_aggregates() {
+        for query in [
+            "MATCH (a)-[:KNOWS]->(b) RETURN a.name AS name, count(b) AS c ORDER BY c DESC, name",
+            "MATCH (a)-[:KNOWS]->(b) RETURN a.name AS name, count(b) AS c ORDER BY a.name + count(b)",
+            "MATCH (a)-[:KNOWS]->(b) RETURN a, count(b) AS c ORDER BY a.age",
+            "MATCH (a) RETURN DISTINCT a.name ORDER BY a.name",
+            "MATCH (a) RETURN DISTINCT a.name AS name ORDER BY toUpper(name)",
+            "MATCH (a) RETURN count(*) AS c ORDER BY count(*)",
+        ] {
+            lower(query).unwrap_or_else(|error| panic!("{query}: {error}"));
+        }
+    }
+
+    #[test]
+    fn plain_return_still_sorts_by_a_binding_it_does_not_return() {
+        lower("MATCH (a) RETURN a.name AS name ORDER BY a.age").unwrap();
+    }
 }
